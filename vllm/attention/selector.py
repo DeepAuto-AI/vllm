@@ -25,6 +25,7 @@ class _Backend(enum.Enum):
     FLASHINFER = enum.auto()
     PALLAS = enum.auto()
     IPEX = enum.auto()
+    HIP_ATTN = enum.auto()
 
 
 def backend_name_to_enum(backend_name: str) -> _Backend:
@@ -113,6 +114,9 @@ def get_attn_backend(
         from vllm.attention.backends.flash_attn import (  # noqa: F401
             FlashAttentionBackend)
         return FlashAttentionBackend
+    if backend == _Backend.HIP_ATTN:
+        from vllm.attention.backends.hip_attn import HiPAttentionBackend
+        return HiPAttentionBackend
     if backend == _Backend.XFORMERS:
         logger.info("Using XFormers backend.")
         from vllm.attention.backends.xformers import (  # noqa: F401
