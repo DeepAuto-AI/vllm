@@ -656,19 +656,19 @@ class HiPAttentionImpl(AttentionImpl):
             None
             ---
             """
-            print('---')
-            print(
-                decode_query.unsqueeze(1).shape,
-                key_cache.shape,
-                value_cache.shape,
-                decode_meta.block_tables,
-                decode_meta.seq_lens_tensor,
-                self.scale,
-                self.alibi_slopes,
+            # print('---')
+            # print(
+            #     decode_query.unsqueeze(1).shape,
+            #     key_cache.shape,
+            #     value_cache.shape,
+            #     decode_meta.block_tables,
+            #     decode_meta.seq_lens_tensor,
+            #     self.scale,
+            #     self.alibi_slopes,
                 
-                sep='\n'
-            )
-            print('---')
+            #     sep='\n'
+            # )
+            # print('---')
 
         # Reshape the output tensor.
         return output.view(num_tokens, hidden_size)
