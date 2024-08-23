@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import torch
 from vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from hip import hip_attention
+from hip import hip_attention, paged_hip_attention, varlen_hip_attention, HiPAttentionArgs
 
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (
@@ -460,6 +460,15 @@ class HiPAttentionImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by HiPAttention. "
                 f"Supported head sizes are: {support_head_sizes}."
             )
+        
+        self.base_kwargs = {
+            'mask_k': 512,
+            'block_size_q': 32,
+            'block_size_k': 2,
+            'block_stride_k': 1,
+            'sliding_window_size': 512,
+            'sink_token_size': 32,
+        }
 
     def forward(
         self,
@@ -544,22 +553,36 @@ class HiPAttentionImpl(AttentionImpl):
                 # When block_tables are not filled, it means q and k are the
                 # prompt, and they have the same length.
                 
-                out = flash_attn_varlen_func(
-                    q=query,
-                    k=key,
-                    v=value,
-                    cu_seqlens_q=prefill_meta.seq_start_loc,
-                    cu_seqlens_k=prefill_meta.seq_start_loc,
-                    max_seqlen_q=prefill_meta.max_prefill_seq_len,
-                    max_seqlen_k=prefill_meta.max_prefill_seq_len,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    window_size=self.sliding_window,
-                    alibi_slopes=self.alibi_slopes,
-                    softcap=self.logits_soft_cap,
-                )
+                assert self.alibi_slopes == None
+                assert self.logits_soft_cap == 0
+                assert self.sliding_window == (-1, -1)
                 
-                print('---')
+                if prefill_meta.max_prefill_seq_len < -10000000:
+                    out = flash_attn_varlen_func(
+                        q=query,
+                        k=key,
+                        v=value,
+                        cu_seqlens_q=prefill_meta.seq_start_loc,
+                        cu_seqlens_k=prefill_meta.seq_start_loc,
+                        max_seqlen_q=prefill_meta.max_prefill_seq_len,
+                        max_seqlen_k=prefill_meta.max_prefill_seq_len,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        window_size=self.sliding_window,
+                        alibi_slopes=self.alibi_slopes,
+                        softcap=self.logits_soft_cap,
+                    )
+                else:
+                    out = varlen_hip_attention(
+                        q=query,
+                        softmax_scale=self.scale,
+                        k=key,
+                        v=value,
+                        seq_lens=prefill_meta.seq_lens,
+                        args=HiPAttentionArgs(**self.base_kwargs)
+                    )
+                
+                print('--- prefill')
                 print(
                     out.shape,
                     query.shape, 
@@ -583,6 +606,7 @@ class HiPAttentionImpl(AttentionImpl):
             else:
                 # prefix-enabled attention
                 # TODO(heejun): not supported yet
+                raise NotImplementedError()
                 assert prefill_meta.seq_lens is not None
                 max_seq_len = max(prefill_meta.seq_lens)
                 output[:num_prefill_tokens] = flash_attn_varlen_func(
@@ -600,7 +624,7 @@ class HiPAttentionImpl(AttentionImpl):
                     softcap=self.logits_soft_cap,
                 )
                 
-                print('---')
+                print('--- prefix')
                 print(
                     query.shape, 
                     key_cache.shape,
@@ -621,29 +645,44 @@ class HiPAttentionImpl(AttentionImpl):
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
             
-            output[num_prefill_tokens:] = flash_attn_with_kvcache(
-                decode_query.unsqueeze(1),
-                key_cache,
-                value_cache,
-                block_table=decode_meta.block_tables,
-                cache_seqlens=decode_meta.seq_lens_tensor,
+            assert self.alibi_slopes is None
+            out, _ = paged_hip_attention(
+                q=decode_query.unsqueeze(1),
                 softmax_scale=self.scale,
-                causal=True,
-                alibi_slopes=self.alibi_slopes,
-            ).squeeze(1)
+                args=HiPAttentionArgs(
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    block_table=decode_meta.block_tables,
+                    cache_seq_lens=decode_meta.seq_lens_tensor,
+                    **self.base_kwargs,
+                )
+            )
             
-            if random.random() < 0.05:
-                os.makedirs('cache/vllm/hip_attn', exist_ok=True)
-                torch.save({
-                    'out': output[num_prefill_tokens:].unsqueeze(1),
-                    'q': decode_query.unsqueeze(1),
-                    'k': key_cache,
-                    'v': value_cache,
-                    'block_table': decode_meta.block_tables,
-                    'cache_seq_lens': decode_meta.seq_lens_tensor,
-                    'softmax_scale': self.scale,
-                    'alibi_slopes': self.alibi_slopes,
-                }, 'cache/vllm/hip_attn/decode_example.pth')
+            output[num_prefill_tokens:] = out.squeeze(1)
+            
+            # output[num_prefill_tokens:] = flash_attn_with_kvcache(
+            #     decode_query.unsqueeze(1),
+            #     key_cache,
+            #     value_cache,
+            #     block_table=decode_meta.block_tables,
+            #     cache_seqlens=decode_meta.seq_lens_tensor,
+            #     softmax_scale=self.scale,
+            #     causal=True,
+            #     alibi_slopes=self.alibi_slopes,
+            # ).squeeze(1)
+            
+            # if random.random() < 0.05:
+            #     os.makedirs('cache/vllm/hip_attn', exist_ok=True)
+            #     torch.save({
+            #         'out': output[num_prefill_tokens:].unsqueeze(1),
+            #         'q': decode_query.unsqueeze(1),
+            #         'k': key_cache,
+            #         'v': value_cache,
+            #         'block_table': decode_meta.block_tables,
+            #         'cache_seq_lens': decode_meta.seq_lens_tensor,
+            #         'softmax_scale': self.scale,
+            #         'alibi_slopes': self.alibi_slopes,
+            #     }, 'cache/vllm/hip_attn/decode_example.pth')
             
             """
             ---
