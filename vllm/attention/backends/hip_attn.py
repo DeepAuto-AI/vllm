@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import torch
 from vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from hip import hip_attention, paged_hip_attention, varlen_hip_attention, HiPAttentionArgs
+from hip import (
+    paged_hip_attention, 
+    varlen_hip_attention, 
+    paged_varlen_hip_attention,
+    HiPAttentionArgs, 
+)
 
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (
@@ -469,6 +474,8 @@ class HiPAttentionImpl(AttentionImpl):
             'sliding_window_size': 512,
             'sink_token_size': 32,
         }
+        
+        self.hip_seq_threshold = 4096
 
     def forward(
         self,
@@ -582,65 +589,83 @@ class HiPAttentionImpl(AttentionImpl):
                         args=HiPAttentionArgs(**self.base_kwargs)
                     )
                 
-                print('--- prefill')
-                print(
-                    out.shape,
-                    query.shape, 
-                    key.shape, 
-                    value.shape,
-                    prefill_meta.seq_start_loc,
-                    prefill_meta.seq_start_loc,
-                    prefill_meta.max_prefill_seq_len,
-                    prefill_meta.max_prefill_seq_len,
-                    self.scale,
-                    self.sliding_window,
-                    self.alibi_slopes,
-                    self.logits_soft_cap,
+                # print('--- prefill')
+                # print(
+                #     out.shape,
+                #     query.shape, 
+                #     key.shape, 
+                #     value.shape,
+                #     prefill_meta.seq_start_loc,
+                #     prefill_meta.seq_start_loc,
+                #     prefill_meta.max_prefill_seq_len,
+                #     prefill_meta.max_prefill_seq_len,
+                #     self.scale,
+                #     self.sliding_window,
+                #     self.alibi_slopes,
+                #     self.logits_soft_cap,
                     
-                    sep='\n'
-                )
-                print('---')
+                #     sep='\n'
+                # )
+                # print('---')
                 
                 assert output[:num_prefill_tokens].shape == out.shape
                 output[:num_prefill_tokens] = out
             else:
                 # prefix-enabled attention
                 # TODO(heejun): not supported yet
-                raise NotImplementedError()
-                assert prefill_meta.seq_lens is not None
-                max_seq_len = max(prefill_meta.seq_lens)
-                output[:num_prefill_tokens] = flash_attn_varlen_func(
-                    q=query,
-                    k=key_cache,
-                    v=value_cache,
-                    cu_seqlens_q=prefill_meta.query_start_loc,
-                    max_seqlen_q=prefill_meta.max_query_len,
-                    cu_seqlens_k=prefill_meta.seq_start_loc,
-                    max_seqlen_k=max_seq_len,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    alibi_slopes=self.alibi_slopes,
-                    block_table=prefill_meta.block_tables,
-                    softcap=self.logits_soft_cap,
-                )
                 
-                print('--- prefix')
-                print(
-                    query.shape, 
-                    key_cache.shape,
-                    value_cache.shape, 
-                    prefill_meta.query_start_loc,
-                    prefill_meta.max_query_len,
-                    prefill_meta.seq_start_loc,
-                    max_seq_len,
-                    self.scale,
-                    self.alibi_slopes,
-                    prefill_meta.block_tables,
-                    self.logits_soft_cap,
+                # print('--- prefix')
+                # print(
+                #     query.shape, 
+                #     key_cache.shape,
+                #     value_cache.shape, 
+                #     prefill_meta.query_start_loc,
+                #     prefill_meta.max_query_len,
+                #     prefill_meta.seq_start_loc,
+                #     max(prefill_meta.seq_lens),
+                #     self.scale,
+                #     self.alibi_slopes,
+                #     prefill_meta.block_tables,
+                #     self.logits_soft_cap,
                     
-                    sep='\n'
+                #     sep='\n'
+                # )
+                # print('---')
+                
+                assert prefill_meta.seq_lens is not None
+                # max_seq_len = max(prefill_meta.seq_lens)
+                # output[:num_prefill_tokens] = flash_attn_varlen_func(
+                #     q=query,
+                #     k=key_cache,
+                #     v=value_cache,
+                #     cu_seqlens_q=prefill_meta.query_start_loc,
+                #     max_seqlen_q=prefill_meta.max_query_len,
+                #     cu_seqlens_k=prefill_meta.seq_start_loc,
+                #     max_seqlen_k=max_seq_len,
+                #     softmax_scale=self.scale,
+                #     causal=True,
+                #     alibi_slopes=self.alibi_slopes,
+                #     block_table=prefill_meta.block_tables,
+                #     softcap=self.logits_soft_cap,
+                # )
+                
+                assert self.alibi_slopes is None
+                assert self.logits_soft_cap == 0
+                
+                # print('prefill')
+                
+                output[:num_prefill_tokens] = paged_varlen_hip_attention(
+                    q=query,
+                    softmax_scale=self.scale,
+                    seq_lens=prefill_meta.seq_lens,
+                    args=HiPAttentionArgs(
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        block_table=prefill_meta.block_tables,
+                        cache_seq_lens=prefill_meta.seq_lens_tensor,
+                        **self.base_kwargs
+                    )
                 )
-                print('---')
 
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
