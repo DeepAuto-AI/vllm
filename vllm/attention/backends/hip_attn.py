@@ -476,7 +476,7 @@ class HiPAttentionImpl(AttentionImpl):
             'block_stride_k': 2,
             'sample_method': 'last',
             'sliding_window_size': 256,
-            'sink_token_size': 4,
+            'sink_token_size': 16,
         }
         self.hip_seq_threshold = 4096
         self.dense_layer_indices = [0, 1, 2]
