@@ -409,6 +409,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         kv_cache_dtype: str,
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
+        layer_index: int = 0,
     ) -> None:
         if blocksparse_params is not None:
             raise ValueError(

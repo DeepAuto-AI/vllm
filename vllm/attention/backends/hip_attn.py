@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import os
 import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
+from dataclasses import dataclass
 
 import torch
 from vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
@@ -213,8 +214,7 @@ class HiPAttentionMetadata(AttentionMetadata):
         return self._cached_decode_metadata
 
 
-class HiPAttentionMetadataBuilder(
-        AttentionMetadataBuilder[HiPAttentionMetadata]):
+class HiPAttentionMetadataBuilder(AttentionMetadataBuilder[HiPAttentionMetadata]):
 
     def __init__(self, input_builder: "ModelInputForGPUBuilder"):
         self.slot_mapping: List[int] = []
@@ -432,6 +432,7 @@ class HiPAttentionImpl(AttentionImpl):
         kv_cache_dtype: str,
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
+        layer_index: int = 0,
     ) -> None:
         if blocksparse_params is not None:
             raise ValueError(
@@ -466,16 +467,19 @@ class HiPAttentionImpl(AttentionImpl):
                 f"Supported head sizes are: {support_head_sizes}."
             )
         
-        self.base_kwargs = {
+        self.layer_index = layer_index
+        
+        self.hip_kwargs = {
             'mask_k': 512,
             'block_size_q': 32,
-            'block_size_k': 2,
-            'block_stride_k': 1,
-            'sliding_window_size': 512,
-            'sink_token_size': 32,
+            'block_size_k': 4,
+            'block_stride_k': 2,
+            'sample_method': 'last',
+            'sliding_window_size': 256,
+            'sink_token_size': 4,
         }
-        
         self.hip_seq_threshold = 4096
+        self.dense_layer_indices = [0, 1, 2]
 
     def forward(
         self,
@@ -564,7 +568,8 @@ class HiPAttentionImpl(AttentionImpl):
                 assert self.logits_soft_cap == 0
                 assert self.sliding_window == (-1, -1)
                 
-                if prefill_meta.max_prefill_seq_len < -10000000:
+                if  (prefill_meta.max_prefill_seq_len < -10000000) or\
+                    (self.layer_index in self.dense_layer_indices):
                     out = flash_attn_varlen_func(
                         q=query,
                         k=key,
@@ -586,153 +591,76 @@ class HiPAttentionImpl(AttentionImpl):
                         k=key,
                         v=value,
                         seq_lens=prefill_meta.seq_lens,
-                        args=HiPAttentionArgs(**self.base_kwargs)
+                        args=HiPAttentionArgs(**self.hip_kwargs)
                     )
-                
-                # print('--- prefill')
-                # print(
-                #     out.shape,
-                #     query.shape, 
-                #     key.shape, 
-                #     value.shape,
-                #     prefill_meta.seq_start_loc,
-                #     prefill_meta.seq_start_loc,
-                #     prefill_meta.max_prefill_seq_len,
-                #     prefill_meta.max_prefill_seq_len,
-                #     self.scale,
-                #     self.sliding_window,
-                #     self.alibi_slopes,
-                #     self.logits_soft_cap,
-                    
-                #     sep='\n'
-                # )
-                # print('---')
                 
                 assert output[:num_prefill_tokens].shape == out.shape
                 output[:num_prefill_tokens] = out
             else:
                 # prefix-enabled attention
-                # TODO(heejun): not supported yet
-                
-                # print('--- prefix')
-                # print(
-                #     query.shape, 
-                #     key_cache.shape,
-                #     value_cache.shape, 
-                #     prefill_meta.query_start_loc,
-                #     prefill_meta.max_query_len,
-                #     prefill_meta.seq_start_loc,
-                #     max(prefill_meta.seq_lens),
-                #     self.scale,
-                #     self.alibi_slopes,
-                #     prefill_meta.block_tables,
-                #     self.logits_soft_cap,
-                    
-                #     sep='\n'
-                # )
-                # print('---')
                 
                 assert prefill_meta.seq_lens is not None
-                # max_seq_len = max(prefill_meta.seq_lens)
-                # output[:num_prefill_tokens] = flash_attn_varlen_func(
-                #     q=query,
-                #     k=key_cache,
-                #     v=value_cache,
-                #     cu_seqlens_q=prefill_meta.query_start_loc,
-                #     max_seqlen_q=prefill_meta.max_query_len,
-                #     cu_seqlens_k=prefill_meta.seq_start_loc,
-                #     max_seqlen_k=max_seq_len,
-                #     softmax_scale=self.scale,
-                #     causal=True,
-                #     alibi_slopes=self.alibi_slopes,
-                #     block_table=prefill_meta.block_tables,
-                #     softcap=self.logits_soft_cap,
-                # )
-                
                 assert self.alibi_slopes is None
                 assert self.logits_soft_cap == 0
                 
-                # print('prefill')
-                
-                output[:num_prefill_tokens] = paged_varlen_hip_attention(
-                    q=query,
-                    softmax_scale=self.scale,
-                    seq_lens=prefill_meta.seq_lens,
-                    args=HiPAttentionArgs(
-                        k_cache=key_cache,
-                        v_cache=value_cache,
+                if self.layer_index in self.dense_layer_indices:
+                    max_seq_len = max(prefill_meta.seq_lens)
+                    output[:num_prefill_tokens] = flash_attn_varlen_func(
+                        q=query,
+                        k=key_cache,
+                        v=value_cache,
+                        cu_seqlens_q=prefill_meta.query_start_loc,
+                        max_seqlen_q=prefill_meta.max_query_len,
+                        cu_seqlens_k=prefill_meta.seq_start_loc,
+                        max_seqlen_k=max_seq_len,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        alibi_slopes=self.alibi_slopes,
                         block_table=prefill_meta.block_tables,
-                        cache_seq_lens=prefill_meta.seq_lens_tensor,
-                        **self.base_kwargs
+                        softcap=self.logits_soft_cap,
                     )
-                )
+                else:
+                    output[:num_prefill_tokens] = paged_varlen_hip_attention(
+                        q=query,
+                        softmax_scale=self.scale,
+                        seq_lens=prefill_meta.seq_lens,
+                        args=HiPAttentionArgs(
+                            k_cache=key_cache,
+                            v_cache=value_cache,
+                            block_table=prefill_meta.block_tables,
+                            cache_seq_lens=prefill_meta.seq_lens_tensor,
+                            **self.hip_kwargs
+                        )
+                    )
 
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
             
             assert self.alibi_slopes is None
-            out, _ = paged_hip_attention(
-                q=decode_query.unsqueeze(1),
-                softmax_scale=self.scale,
-                args=HiPAttentionArgs(
-                    k_cache=key_cache,
-                    v_cache=value_cache,
+            if self.layer_index in self.dense_layer_indices:
+                output[num_prefill_tokens:] = flash_attn_with_kvcache(
+                    decode_query.unsqueeze(1),
+                    key_cache,
+                    value_cache,
                     block_table=decode_meta.block_tables,
-                    cache_seq_lens=decode_meta.seq_lens_tensor,
-                    **self.base_kwargs,
+                    cache_seqlens=decode_meta.seq_lens_tensor,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                ).squeeze(1)
+            else:
+                out, _ = paged_hip_attention(
+                    q=decode_query.unsqueeze(1),
+                    softmax_scale=self.scale,
+                    args=HiPAttentionArgs(
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        block_table=decode_meta.block_tables,
+                        cache_seq_lens=decode_meta.seq_lens_tensor,
+                        **self.hip_kwargs,
+                    )
                 )
-            )
-            
-            output[num_prefill_tokens:] = out.squeeze(1)
-            
-            # output[num_prefill_tokens:] = flash_attn_with_kvcache(
-            #     decode_query.unsqueeze(1),
-            #     key_cache,
-            #     value_cache,
-            #     block_table=decode_meta.block_tables,
-            #     cache_seqlens=decode_meta.seq_lens_tensor,
-            #     softmax_scale=self.scale,
-            #     causal=True,
-            #     alibi_slopes=self.alibi_slopes,
-            # ).squeeze(1)
-            
-            # if random.random() < 0.05:
-            #     os.makedirs('cache/vllm/hip_attn', exist_ok=True)
-            #     torch.save({
-            #         'out': output[num_prefill_tokens:].unsqueeze(1),
-            #         'q': decode_query.unsqueeze(1),
-            #         'k': key_cache,
-            #         'v': value_cache,
-            #         'block_table': decode_meta.block_tables,
-            #         'cache_seq_lens': decode_meta.seq_lens_tensor,
-            #         'softmax_scale': self.scale,
-            #         'alibi_slopes': self.alibi_slopes,
-            #     }, 'cache/vllm/hip_attn/decode_example.pth')
-            
-            """
-            ---
-            torch.Size([1, 1, 32, 128])
-            torch.Size([12055, 16, 8, 128])
-            torch.Size([12055, 16, 8, 128])
-            tensor([[12054, 12053]], device='cuda:0', dtype=torch.int32)
-            tensor([27], device='cuda:0', dtype=torch.int32)
-            0.08838834764831845
-            None
-            ---
-            """
-            # print('---')
-            # print(
-            #     decode_query.unsqueeze(1).shape,
-            #     key_cache.shape,
-            #     value_cache.shape,
-            #     decode_meta.block_tables,
-            #     decode_meta.seq_lens_tensor,
-            #     self.scale,
-            #     self.alibi_slopes,
-                
-            #     sep='\n'
-            # )
-            # print('---')
+                output[num_prefill_tokens:] = out.squeeze(1)
 
         # Reshape the output tensor.
         return output.view(num_tokens, hidden_size)

@@ -98,6 +98,7 @@ class LayerFn(Protocol):
     def __call__(
         self,
         prefix="",
+        idx="",
     ) -> torch.nn.Module:
         ...
 
@@ -192,7 +193,7 @@ def make_layers(
                                             get_pp_group().world_size)
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)] + [
-            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
+            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}", idx=idx))
             for idx in range(start_layer, end_layer)
         ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
     return start_layer, end_layer, modules

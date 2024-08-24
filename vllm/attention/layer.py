@@ -36,6 +36,7 @@ class Attention(nn.Module):
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         prefix: str = "",
+        layer_index: int = 0,
     ) -> None:
         super().__init__()
         if cache_config is not None:
@@ -81,9 +82,11 @@ class Attention(nn.Module):
                                         block_size, blocksparse_params
                                         is not None)
         impl_cls = attn_backend.get_impl_cls()
-        self.impl = impl_cls(num_heads, head_size, scale, num_kv_heads,
-                             alibi_slopes, sliding_window, kv_cache_dtype,
-                             blocksparse_params, logits_soft_cap)
+        self.impl = impl_cls(
+            num_heads, head_size, scale, num_kv_heads,
+            alibi_slopes, sliding_window, kv_cache_dtype,
+            blocksparse_params, logits_soft_cap, layer_index
+        )
 
     def forward(
         self,
