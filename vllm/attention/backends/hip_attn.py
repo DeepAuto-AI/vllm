@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
 class HiPAttentionEnvs:
     def __init__(self):
-        self.refresh_interval = int(os.getenv('HIP_REFRESH_INTERVAL', '4'))
+        self.refresh_interval = int(os.getenv('HIP_REFRESH_INTERVAL', '8'))
         self.hip_dense_layers = os.getenv('HIP_DENSE_LAYERS', '0,1,2')
         try:
             t = int(self.hip_dense_layers)
@@ -51,15 +51,16 @@ class HiPAttentionEnvs:
                 'Are you sure about this?'
             )
         except: pass
+        self.hip_dense_layers = [int(i) for i in self.hip_dense_layers.split(',')]
         self.hip_k = int(os.getenv('HIP_K', '512'))
         self.hip_bq = int(os.getenv('HIP_BQ', '32'))
         self.hip_bsq = int(os.getenv('HIP_BSK', '2'))
-        self.hip_bk = int(os.getenv('HIP_BK', '4'))
-        self.hip_bsk = int(os.getenv('HIP_BSK', '2'))
+        self.hip_bk = int(os.getenv('HIP_BK', '2'))
+        self.hip_bsk = int(os.getenv('HIP_BSK', '1'))
         self.hip_sw = int(os.getenv('HIP_SW', '256'))
         self.hip_nsink = int(os.getenv('HIP_NSINK', '16'))
         self.hip_sample_method = os.getenv('HIP_SAMPLE_METHOD', 'last')
-        self.hip_seq_threshold = int(os.getenv('HIP_SEQ_THRESH', '4096'))
+        self.hip_seq_threshold = int(os.getenv('HIP_SEQ_THRESH', '-1'))
 
 envs = HiPAttentionEnvs()
 
@@ -506,7 +507,7 @@ class HiPAttentionImpl(AttentionImpl):
             'sink_token_size': envs.hip_nsink,
         }
         self.hip_seq_threshold = envs.hip_seq_threshold
-        self.dense_layer_indices = int(range(envs.num_dense_layers))
+        self.dense_layer_indices = envs.hip_dense_layers
         
         self.checkout_last_mask_metadata = False
         self.use_last_mask = False

@@ -1,6 +1,7 @@
 import dataclasses
 import gc
 import itertools
+import os
 import time
 import warnings
 import weakref
@@ -1550,6 +1551,13 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
 
+        benchmark_runner = os.getenv('BENCHMARK_RUNNER', '0') == '1'
+
+        if benchmark_runner:
+            timer_forward_start = torch.cuda.Event(enable_timing=True)
+            timer_forward_end = torch.cuda.Event(enable_timing=True)
+            timer_forward_start.record()
+
         hidden_or_intermediate_states = model_executable(
             input_ids=model_input.input_tokens,
             positions=model_input.input_positions,
@@ -1562,6 +1570,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             ),
             **seqlen_agnostic_kwargs
         )
+        
+        if benchmark_runner:
+            timer_forward_end.record()
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
@@ -1610,6 +1621,11 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 hidden_states = hidden_or_intermediate_states
 
             output.hidden_states = hidden_states
+        
+        if benchmark_runner:
+            timer_forward_end.synchronize()
+            time_forward = timer_forward_start.elapsed_time(timer_forward_end)
+            print(f'[{tuple(model_input.input_tokens.shape)}] {time_forward:.3f}')
 
         return [output]
 
