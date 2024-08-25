@@ -8,6 +8,7 @@ import os
 import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 from dataclasses import dataclass
+import warnings
 
 import torch
 from vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
@@ -16,6 +17,7 @@ from hip import (
     varlen_hip_attention, 
     paged_varlen_hip_attention,
     HiPAttentionArgs, 
+    HiPAttentionOutputMetadata,
 )
 
 from vllm import _custom_ops as ops
@@ -36,6 +38,30 @@ from vllm.utils import async_tensor_h2d, make_tensor_with_pad
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUBuilder
+
+class HiPAttentionEnvs:
+    def __init__(self):
+        self.refresh_interval = int(os.getenv('HIP_REFRESH_INTERVAL', '4'))
+        self.hip_dense_layers = os.getenv('HIP_DENSE_LAYERS', '0,1,2')
+        try:
+            t = int(self.hip_dense_layers)
+            warnings.warn(
+                'You gave single integer for hip dense layers. '
+                'From HiP 1.1, this changed into list of integers, e.g., `0,1,2` '
+                'Are you sure about this?'
+            )
+        except: pass
+        self.hip_k = int(os.getenv('HIP_K', '512'))
+        self.hip_bq = int(os.getenv('HIP_BQ', '32'))
+        self.hip_bsq = int(os.getenv('HIP_BSK', '2'))
+        self.hip_bk = int(os.getenv('HIP_BK', '4'))
+        self.hip_bsk = int(os.getenv('HIP_BSK', '2'))
+        self.hip_sw = int(os.getenv('HIP_SW', '256'))
+        self.hip_nsink = int(os.getenv('HIP_NSINK', '16'))
+        self.hip_sample_method = os.getenv('HIP_SAMPLE_METHOD', 'last')
+        self.hip_seq_threshold = int(os.getenv('HIP_SEQ_THRESH', '4096'))
+
+envs = HiPAttentionEnvs()
 
 class HiPAttentionBackend(AttentionBackend):
 
@@ -470,16 +496,22 @@ class HiPAttentionImpl(AttentionImpl):
         self.layer_index = layer_index
         
         self.hip_kwargs = {
-            'mask_k': 512,
-            'block_size_q': 32,
-            'block_size_k': 4,
-            'block_stride_k': 2,
-            'sample_method': 'last',
-            'sliding_window_size': 256,
-            'sink_token_size': 16,
+            'mask_k': envs.hip_k,
+            'block_size_q': envs.hip_bq,
+            'block_stride_k': envs.hip_bsq,
+            'block_size_k': envs.hip_bk,
+            'block_stride_k': envs.hip_bsk,
+            'sample_method': envs.hip_sample_method,
+            'sliding_window_size': envs.hip_sw,
+            'sink_token_size': envs.hip_nsink,
         }
-        self.hip_seq_threshold = 4096
-        self.dense_layer_indices = [0, 1, 2]
+        self.hip_seq_threshold = envs.hip_seq_threshold
+        self.dense_layer_indices = int(range(envs.num_dense_layers))
+        
+        self.checkout_last_mask_metadata = False
+        self.use_last_mask = False
+        self.last_mask_metadata: Optional[
+            HiPAttentionOutputMetadata] = None
 
     def forward(
         self,
@@ -568,7 +600,7 @@ class HiPAttentionImpl(AttentionImpl):
                 assert self.logits_soft_cap == 0
                 assert self.sliding_window == (-1, -1)
                 
-                if  (prefill_meta.max_prefill_seq_len < -10000000) or\
+                if  (prefill_meta.max_prefill_seq_len < self.hip_seq_threshold) or\
                     (self.layer_index in self.dense_layer_indices):
                     out = flash_attn_varlen_func(
                         q=query,
@@ -603,8 +635,9 @@ class HiPAttentionImpl(AttentionImpl):
                 assert self.alibi_slopes is None
                 assert self.logits_soft_cap == 0
                 
-                if self.layer_index in self.dense_layer_indices:
-                    max_seq_len = max(prefill_meta.seq_lens)
+                max_seq_len = max(prefill_meta.seq_lens)
+                if  (max_seq_len < self.hip_seq_threshold) or\
+                    self.layer_index in self.dense_layer_indices:
                     output[:num_prefill_tokens] = flash_attn_varlen_func(
                         q=query,
                         k=key_cache,
@@ -649,7 +682,10 @@ class HiPAttentionImpl(AttentionImpl):
                     alibi_slopes=self.alibi_slopes,
                 ).squeeze(1)
             else:
-                out, _ = paged_hip_attention(
+                if not self.use_last_mask:
+                    self.last_mask_metadata = None
+                
+                out, hip_meta = paged_hip_attention(
                     q=decode_query.unsqueeze(1),
                     softmax_scale=self.scale,
                     args=HiPAttentionArgs(
@@ -658,9 +694,13 @@ class HiPAttentionImpl(AttentionImpl):
                         block_table=decode_meta.block_tables,
                         cache_seq_lens=decode_meta.seq_lens_tensor,
                         **self.hip_kwargs,
-                    )
+                    ),
+                    previous_mask_metadata=self.last_mask_metadata,
                 )
                 output[num_prefill_tokens:] = out.squeeze(1)
+                
+                if self.checkout_last_mask_metadata:
+                    self.last_mask_metadata = hip_meta
 
         # Reshape the output tensor.
         return output.view(num_tokens, hidden_size)

@@ -25,7 +25,9 @@ except ImportError:
     FLASHINFER_WORKSPACE_BUFFER_SIZE = 0
 
 import vllm.envs as envs
-from vllm.attention import AttentionMetadata, get_attn_backend
+from vllm.attention import AttentionMetadata, get_attn_backend, Attention
+from vllm.attention.backends.hip_attn import HiPAttentionImpl
+from vllm.attention.backends.hip_attn import envs as hip_envs
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, MultiModalConfig, ObservabilityConfig,
                          ParallelConfig, PromptAdapterConfig, SchedulerConfig)
@@ -1340,8 +1342,14 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                         self.set_active_prompt_adapters(
                             set(), prompt_adapter_mapping)
 
-                    graph_runner = CUDAGraphRunner(
-                        self.model, self.attn_backend.get_name())
+                    if self.attn_backend.get_name() == 'hip-attn':
+                        graph_runner = HiPCUDAGraphRunner(
+                            self.model, self.attn_backend.get_name()
+                        )
+                    else:
+                        graph_runner = CUDAGraphRunner(
+                            self.model, self.attn_backend.get_name()
+                        )
 
                     if self.attn_backend.get_name() == "flashinfer":
                         graph_runner.flashinfer_indptr_buffer = _indptr_buffer
@@ -1384,9 +1392,13 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                                 batch_size)
                         })
                     graph_runner.capture(**capture_inputs)
-                    self.graph_memory_pool = graph_runner.graph.pool()
+                    if self.attn_backend.get_name() == 'hip-attn':
+                        self.graph_memory_pool = graph_runner.runner_mask_cached.graph.pool()
+                    else:
+                        self.graph_memory_pool = graph_runner.graph.pool()
                     self.graph_runners[virtual_engine][batch_size] = (
-                        graph_runner)
+                        graph_runner
+                    )
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
@@ -1502,8 +1514,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             if model_input.attn_metadata.use_cuda_graph:
                 batch_size = model_input.input_tokens.shape[0]
                 model_input.attn_metadata.decode_wrapper = self.graph_runners[
-                    model_input.
-                    virtual_engine][batch_size].flashinfer_decode_wrapper
+                    model_input.virtual_engine][batch_size].flashinfer_decode_wrapper
             else:
                 model_input.attn_metadata.decode_wrapper = \
                     self.flashinfer_decode_wrapper
@@ -1522,6 +1533,10 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_executable = self.graph_runners[virtual_engine][
                 graph_batch_size]
         else:
+            for engine_runners in self.graph_runners:
+                for runner in engine_runners.values():
+                    if isinstance(runner, HiPCUDAGraphRunner):
+                        runner.step = 0
             model_executable = self.model
 
         multi_modal_kwargs = model_input.multi_modal_kwargs or {}
@@ -1541,9 +1556,12 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             kv_caches=kv_caches,
             attn_metadata=model_input.attn_metadata,
             intermediate_tensors=intermediate_tensors,
-            **MultiModalInputs.as_kwargs(multi_modal_kwargs,
-                                         device=self.device),
-            **seqlen_agnostic_kwargs)
+            **MultiModalInputs.as_kwargs(
+                multi_modal_kwargs,
+                device=self.device
+            ),
+            **seqlen_agnostic_kwargs
+        )
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
@@ -1553,8 +1571,10 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if not get_pp_group().is_last_rank:
             return hidden_or_intermediate_states
 
-        logits = self.model.compute_logits(hidden_or_intermediate_states,
-                                           model_input.sampling_metadata)
+        logits = self.model.compute_logits(
+            hidden_or_intermediate_states,
+            model_input.sampling_metadata
+        )
 
         if not self.is_driver_worker:
             return []
@@ -1569,7 +1589,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 and output is not None):
             model_forward_end.synchronize()
             model_forward_time = model_forward_start.elapsed_time(
-                model_forward_end)
+                model_forward_end
+            )
             # If there are multiple workers, we are still tracking the latency
             # from the start time of the driver worker to the end time of the
             # driver worker. The model forward time will then end up covering
@@ -1592,6 +1613,93 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         return [output]
 
+
+class HiPCUDAGraphRunner:
+    def __init__(self, model: nn.Module, backend_name: str):
+        self.model = model
+        self.backend_name = backend_name
+        
+        self.step = 0
+        self.refresh_interval = hip_envs.refresh_interval
+        
+        self.runner_mask_refresh: CUDAGraphRunner = None
+        self.runner_mask_cached: CUDAGraphRunner = None
+    
+    def capture(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_or_intermediate_states: Optional[Union[
+            IntermediateTensors, 
+            torch.Tensor
+        ]],
+        intermediate_inputs: Optional[IntermediateTensors],
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        memory_pool: Optional[Tuple[int, int]],
+        stream: torch.cuda.Stream,
+        **kwargs,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                impl = module.impl # type: HiPAttentionImpl
+                impl.checkout_last_mask_metadata = True
+                impl.use_last_mask = False
+                impl.last_mask_metadata = None
+        
+        self.runner_mask_refresh = CUDAGraphRunner(self.model, self.backend_name)
+        self.runner_mask_refresh.capture(
+            input_ids=input_ids,
+            positions=positions,
+            hidden_or_intermediate_states=hidden_or_intermediate_states,
+            intermediate_inputs=intermediate_inputs,
+            kv_caches=kv_caches,
+            attn_metadata=attn_metadata,
+            memory_pool=memory_pool,
+            stream=stream,
+            **kwargs
+        )
+        
+        memory_pool = self.runner_mask_refresh.graph.pool()
+        
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                impl = module.impl # type: HiPAttentionImpl
+                impl.checkout_last_mask_metadata = False
+                impl.use_last_mask = True
+        
+        self.runner_mask_cached = CUDAGraphRunner(self.model, self.backend_name)
+        self.runner_mask_cached.capture(
+            input_ids=input_ids,
+            positions=positions,
+            hidden_or_intermediate_states=hidden_or_intermediate_states,
+            intermediate_inputs=intermediate_inputs,
+            kv_caches=kv_caches,
+            attn_metadata=attn_metadata,
+            memory_pool=memory_pool,
+            stream=stream,
+            **kwargs
+        )
+        
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                impl = module.impl # type: HiPAttentionImpl
+                impl.checkout_last_mask_metadata = False
+                impl.use_last_mask = False
+                impl.last_mask_metadata = None
+    
+    def forward(
+        self, *args, **kwargs,
+    ) -> torch.Tensor:
+        step_to_refresh = (self.step % self.refresh_interval) == 0
+        self.step += 1
+        if step_to_refresh:
+            return self.runner_mask_refresh.forward(*args, **kwargs)
+        else:
+            return self.runner_mask_cached.forward(*args, **kwargs)
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
 
 class CUDAGraphRunner:
 
