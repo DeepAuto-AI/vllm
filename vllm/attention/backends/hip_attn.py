@@ -62,6 +62,7 @@ class HiPAttentionEnvs:
         self.hip_sample_method = os.getenv('HIP_SAMPLE_METHOD', 'center')
         self.hip_seq_threshold = int(os.getenv('HIP_SEQ_THRESH', '-1'))
         self.hip_offload = os.getenv('HIP_OFFLOAD', '0') == '1'
+        self.hip_offload_cache_scale = float(os.getenv('HIP_OFFLOAD_CACHE_SCALE', '4'))
 
 envs = HiPAttentionEnvs()
 
