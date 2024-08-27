@@ -1,7 +1,7 @@
 """A GPU worker class."""
 import gc
 import os
-from typing import List, Optional, Set, Tuple, Type
+from typing import List, Optional, Set, Tuple, Type, Union
 
 import torch
 import torch.distributed
@@ -20,11 +20,13 @@ from vllm.platforms import current_platform
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import ExecuteModelRequest
 from vllm.worker.cache_engine import CacheEngine
+from vllm.worker.hip_cache_engine import HiPCacheEngine
 from vllm.worker.embedding_model_runner import EmbeddingModelRunner
 from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
 from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
 from vllm.worker.worker_base import LocalOrDistributedWorkerBase, WorkerInput
-
+from vllm import envs
+from vllm.attention.backends.hip_attn import envs as hip_envs
 
 class Worker(LocalOrDistributedWorkerBase):
     """A worker class that executes (a partition of) the model on a GPU.
@@ -109,7 +111,7 @@ class Worker(LocalOrDistributedWorkerBase):
         )
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
-        self.cache_engine: List[CacheEngine]
+        self.cache_engine: List[Union[CacheEngine, HiPCacheEngine]]
         # Initialize gpu_cache as embedding models don't initialize kv_caches
         self.gpu_cache: Optional[List[List[torch.Tensor]]] = None
 
@@ -235,11 +237,26 @@ class Worker(LocalOrDistributedWorkerBase):
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
-        self.cache_engine = [
-            CacheEngine(self.cache_config, self.model_config,
-                        self.parallel_config, self.device_config)
-            for _ in range(self.parallel_config.pipeline_parallel_size)
-        ]
+        if envs.VLLM_ATTENTION_BACKEND == 'HIP_ATTN' and hip_envs.hip_offload:
+            self.cache_engine = [
+                HiPCacheEngine(
+                    self.cache_config, 
+                    self.model_config,
+                    self.parallel_config, 
+                    self.device_config
+                )
+                for _ in range(self.parallel_config.pipeline_parallel_size)
+            ]
+        else:
+            self.cache_engine = [
+                CacheEngine(
+                    self.cache_config, 
+                    self.model_config,
+                    self.parallel_config, 
+                    self.device_config
+                )
+                for _ in range(self.parallel_config.pipeline_parallel_size)
+            ]
         self.gpu_cache = [
             self.cache_engine[ve].gpu_cache
             for ve in range(self.parallel_config.pipeline_parallel_size)
@@ -340,9 +357,17 @@ class Worker(LocalOrDistributedWorkerBase):
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of the KV cache block size in bytes.
         """
-        return CacheEngine.get_cache_block_size(self.cache_config,
-                                                self.model_config,
-                                                self.parallel_config)
+        if envs.VLLM_ATTENTION_BACKEND == 'HIP_ATTN' and hip_envs.hip_offload:
+            return HiPCacheEngine.get_cache_block_size(
+                self.cache_config,
+                self.model_config,
+                self.parallel_config,
+            )
+        return CacheEngine.get_cache_block_size(
+            self.cache_config,
+            self.model_config,
+            self.parallel_config
+        )
 
 
 def init_worker_distributed_environment(

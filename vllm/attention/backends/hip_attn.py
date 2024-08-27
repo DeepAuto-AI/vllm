@@ -59,8 +59,9 @@ class HiPAttentionEnvs:
         self.hip_bsk = int(os.getenv('HIP_BSK', '1'))
         self.hip_sw = int(os.getenv('HIP_SW', '256'))
         self.hip_nsink = int(os.getenv('HIP_NSINK', '16'))
-        self.hip_sample_method = os.getenv('HIP_SAMPLE_METHOD', 'last')
+        self.hip_sample_method = os.getenv('HIP_SAMPLE_METHOD', 'center')
         self.hip_seq_threshold = int(os.getenv('HIP_SEQ_THRESH', '-1'))
+        self.hip_offload = os.getenv('HIP_OFFLOAD', '0') == '1'
 
 envs = HiPAttentionEnvs()
 
