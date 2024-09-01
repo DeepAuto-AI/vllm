@@ -1475,8 +1475,22 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         num_steps: int = 1,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
+        benchmark_runner = os.getenv('BENCHMARK_RUNNER', '0') == '1'    
+        if not hasattr(self, 'start_time') or self.start_time is None:
+            self.start_time = time.time()
+        
         if num_steps > 1:
             raise ValueError("num_steps > 1 is not supported in ModelRunner")
+
+        # ---------------------------------------------------------------------- #
+        # > Input prepare
+        # ---------------------------------------------------------------------- #
+        
+        if benchmark_runner:
+            timer_start = time.time()
+            timer_input_prepare_start = torch.cuda.Event(True)
+            timer_input_prepare_end = torch.cuda.Event(True)
+            timer_input_prepare_start.record()
 
         if self.lora_config:
             assert model_input.lora_requests is not None
@@ -1545,18 +1559,28 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             "finished_requests_ids": model_input.finished_requests_ids,
             "request_ids_to_seq_ids": model_input.request_ids_to_seq_ids,
         } if self.has_seqlen_agnostic else {}
+        
+        if benchmark_runner:
+            timer_input_prepare_end.record()
+        
+        # ---------------------------------------------------------------------- #
+        # > End of (Input prepare)
+        # ---------------------------------------------------------------------- #
+        
+        # ---------------------------------------------------------------------- #
+        # > Model forward
+        # ---------------------------------------------------------------------- #
+        
+        if benchmark_runner:
+            timer_forward_start = torch.cuda.Event(enable_timing=True)
+            timer_forward_end = torch.cuda.Event(enable_timing=True)
+            timer_forward_start.record()
+        
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
             model_forward_start = torch.cuda.Event(enable_timing=True)
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
-
-        benchmark_runner = os.getenv('BENCHMARK_RUNNER', '0') == '1'
-
-        if benchmark_runner:
-            timer_forward_start = torch.cuda.Event(enable_timing=True)
-            timer_forward_end = torch.cuda.Event(enable_timing=True)
-            timer_forward_start.record()
 
         hidden_or_intermediate_states = model_executable(
             input_ids=model_input.input_tokens,
@@ -1571,30 +1595,76 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             **seqlen_agnostic_kwargs
         )
         
-        if benchmark_runner:
-            timer_forward_end.record()
-
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
             model_forward_end.record()
+        
+        if benchmark_runner:
+            timer_forward_end.record()
+            
+        # ---------------------------------------------------------------------- #
+        # > End of (Model forward)
+        # ---------------------------------------------------------------------- #
 
         # Compute the logits in the last pipeline stage.
         if not get_pp_group().is_last_rank:
             return hidden_or_intermediate_states
 
+        # ---------------------------------------------------------------------- #
+        # > Logit compute
+        # ---------------------------------------------------------------------- #
+        
+        if benchmark_runner:
+            timer_logit_start = torch.cuda.Event(True)
+            timer_logit_end = torch.cuda.Event(True)
+            timer_logit_start.record()
+        
         logits = self.model.compute_logits(
             hidden_or_intermediate_states,
             model_input.sampling_metadata
         )
+        
+        if benchmark_runner:
+            timer_logit_end.record()
+        
+        # ---------------------------------------------------------------------- #
+        # > End of (Logit compute)
+        # ---------------------------------------------------------------------- #
 
         if not self.is_driver_worker:
             return []
+        
+        # ---------------------------------------------------------------------- #
+        # > Next token sample
+        # ---------------------------------------------------------------------- #
+
+        if benchmark_runner:
+            timer_sampler_start = torch.cuda.Event(True)
+            timer_sampler_end = torch.cuda.Event(True)
+            timer_sampler_start.record()
 
         # Sample the next token.
         output: SamplerOutput = self.model.sample(
             logits=logits,
             sampling_metadata=model_input.sampling_metadata,
         )
+        
+        if benchmark_runner:
+            timer_sampler_end.record()
+        
+        # ---------------------------------------------------------------------- #
+        # > End of (Next token sample)
+        # ---------------------------------------------------------------------- #
+        
+        # ---------------------------------------------------------------------- #
+        # > Output prepare
+        # ---------------------------------------------------------------------- #
+        
+        if benchmark_runner:
+            timer_output_start = torch.cuda.Event(True)
+            timer_output_end = torch.cuda.Event(True)
+            timer_output_start.record()
+        
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time
                 and output is not None):
@@ -1621,11 +1691,29 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 hidden_states = hidden_or_intermediate_states
 
             output.hidden_states = hidden_states
+            
+        if benchmark_runner:
+            timer_output_end.record()
+            
+        # ---------------------------------------------------------------------- #
+        # > End of (Output prepare)
+        # ---------------------------------------------------------------------- #
         
         if benchmark_runner:
-            timer_forward_end.synchronize()
+            timer_output_end.synchronize()
+            timer_end = time.time()
+            
+            time_input = timer_input_prepare_start.elapsed_time(timer_input_prepare_end)
             time_forward = timer_forward_start.elapsed_time(timer_forward_end)
-            print(f'[{tuple(model_input.input_tokens.shape)}] {time_forward:.3f}')
+            time_logit = timer_logit_start.elapsed_time(timer_logit_end)
+            time_sample = timer_sampler_start.elapsed_time(timer_sampler_end)
+            time_output = timer_output_start.elapsed_time(timer_output_end)
+            time_all = (timer_end - timer_start) * 1000
+            
+            print(
+                f'[timestamp={time.time() - self.start_time:.3f}, ids={tuple(model_input.input_tokens.shape)}] took {time_all:.3f} ms | '
+                f'{time_input:.3f} {time_forward:.3f} {time_logit:.3f} {time_sample:.3f} {time_output:.3f}'
+            )
 
         return [output]
 

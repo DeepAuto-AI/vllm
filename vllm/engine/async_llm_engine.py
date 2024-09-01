@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from functools import partial
 from typing import (AsyncGenerator, Callable, Dict, Iterable, List, Mapping,
@@ -685,6 +686,11 @@ class AsyncLLMEngine:
         """Kick the engine to process the waiting requests.
 
         Returns True if there are in-progress requests."""
+        
+        benchmark_runner = os.getenv('BENCHMARK_RUNNER', '0') == '1'
+        if benchmark_runner:
+            time_start = time.time() * 1000
+            time_add_start = time.time() * 1000
 
         new_requests, aborted_requests = (
             self._request_tracker.get_new_and_aborted_requests())
@@ -709,10 +715,18 @@ class AsyncLLMEngine:
         if aborted_requests:
             await self._engine_abort(aborted_requests)
 
+        if benchmark_runner:
+            time_add_end = time.time() * 1000
+            time_step_start = time.time() * 1000
+
         if self.engine_use_ray:
             request_outputs = await self.engine.step.remote()  # type: ignore
         else:
             request_outputs = await self.engine.step_async(virtual_engine)
+        
+        if benchmark_runner:
+            time_step_end = time.time() * 1000
+            time_out_start = time.time() * 1000
 
         # Put the outputs into the corresponding streams.
         finished = True
@@ -720,7 +734,15 @@ class AsyncLLMEngine:
             self._request_tracker.process_request_output(
                 request_output, verbose=self.log_requests)
             finished = finished and request_output.finished
-
+        
+        if benchmark_runner:
+            time_out_end = time.time() * 1000
+            time_end = time.time() * 1000
+            print(
+                f'AsyncLLMEngine [{time.time():.3f}]: took {time_end-time_start:.3f} | '
+                f'{time_add_end-time_add_start:.3f} {time_step_end-time_step_start:.3f} {time_out_end-time_out_start:.3f}'
+            )
+        
         return not finished
 
     async def _engine_abort(self, request_ids: Iterable[str]):

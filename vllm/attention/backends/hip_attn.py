@@ -3,6 +3,7 @@ Attention Layer with HiPAttention.
 
 DeepAuto-AI @ 2024, Written by Heejun Lee and Geon Park
 """
+import copy
 from dataclasses import dataclass
 import os
 import random
@@ -52,15 +53,23 @@ class HiPAttentionEnvs:
             )
         except: pass
         self.hip_dense_layers = [int(i) for i in self.hip_dense_layers.split(',')]
+        
         self.hip_k = int(os.getenv('HIP_K', '512'))
         self.hip_bq = int(os.getenv('HIP_BQ', '32'))
         self.hip_bsq = int(os.getenv('HIP_BSK', '2'))
         self.hip_bk = int(os.getenv('HIP_BK', '2'))
         self.hip_bsk = int(os.getenv('HIP_BSK', '1'))
+        
+        self.hip_prefill_bk = int(os.getenv('HIP_PREFILL_BK', self.hip_bk))
+        self.hip_prefill_bsk = int(os.getenv('HIP_PREFILL_BSK', self.hip_bsk))
+        
         self.hip_sw = int(os.getenv('HIP_SW', '256'))
         self.hip_nsink = int(os.getenv('HIP_NSINK', '16'))
+        
         self.hip_sample_method = os.getenv('HIP_SAMPLE_METHOD', 'center')
-        self.hip_seq_threshold = int(os.getenv('HIP_SEQ_THRESH', '-1'))
+        
+        self.hip_seq_threshold = int(os.getenv('HIP_SEQ_THRESH', '15000'))
+        
         self.hip_offload = os.getenv('HIP_OFFLOAD', '0') == '1'
 
 envs = HiPAttentionEnvs()
@@ -507,6 +516,14 @@ class HiPAttentionImpl(AttentionImpl):
             'sliding_window_size': envs.hip_sw,
             'sink_token_size': envs.hip_nsink,
         }
+        print(self.hip_kwargs)
+        self.hip_prefill_kwargs = copy.deepcopy(self.hip_kwargs)
+        self.hip_prefill_kwargs.update({
+            'block_size_k': envs.hip_prefill_bk,
+            'block_stride_k': envs.hip_prefill_bsk,
+            'num_dense_queries': envs.hip_seq_threshold,
+        })
+        print(self.hip_prefill_kwargs)
         self.hip_seq_threshold = envs.hip_seq_threshold
         self.dense_layer_indices = envs.hip_dense_layers
         
@@ -625,7 +642,7 @@ class HiPAttentionImpl(AttentionImpl):
                         k=key,
                         v=value,
                         seq_lens=prefill_meta.seq_lens,
-                        args=HiPAttentionArgs(**self.hip_kwargs)
+                        args=HiPAttentionArgs(**self.hip_prefill_kwargs)
                     )
                 
                 assert output[:num_prefill_tokens].shape == out.shape
@@ -664,7 +681,7 @@ class HiPAttentionImpl(AttentionImpl):
                             v_cache=value_cache,
                             block_table=prefill_meta.block_tables,
                             cache_seq_lens=prefill_meta.seq_lens_tensor,
-                            **self.hip_kwargs
+                            **self.hip_prefill_kwargs
                         )
                     )
 
