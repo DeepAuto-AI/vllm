@@ -28,7 +28,7 @@ except ImportError:
 
 import vllm.envs as envs
 from vllm.attention import AttentionMetadata, get_attn_backend, Attention
-from vllm.attention.backends.hip_attn import HiPAttentionImpl
+from vllm.attention.backends.hip_attn import HiPAttentionImpl, HiPAttentionOutputMetadata
 from vllm.attention.backends.hip_attn import envs as hip_envs
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, MultiModalConfig, ObservabilityConfig,
@@ -1731,11 +1731,16 @@ class HiPCUDAGraphRunner:
         
         self.runner_mask_refresh: CUDAGraphRunner = None
         self.runner_mask_cached: CUDAGraphRunner = None
+        self.runner_dense: CUDAGraphRunner = None
         
+        self.use_first_dense_iteration = True
         self.use_prefix_query = True
         self.mask_refresh_prefix_alpha: Dict[torch.nn.Module, torch.Tensor] = {}
         self.mask_refresh_prefixes: Dict[torch.nn.Module, torch.Tensor] = {}
         self.mask_cached_query: Dict[torch.nn.Module, torch.Tensor] = {}
+        self.mask_cached_mask_metadatas: Dict[torch.nn.Module, torch.Tensor] = {}
+        
+        self.dense_cached_query: Dict[torch.nn.Module, torch.Tensor] = {}
     
     def capture(
         self,
@@ -1761,15 +1766,30 @@ class HiPCUDAGraphRunner:
                 impl.last_mask_metadata = None
                 impl.use_query_prefix = False
                 impl.prefix_queries = None
+                impl.force_dense = True
         
-        self.model(
-            input_ids,
-            positions,
-            kv_caches,
-            attn_metadata,
-            intermediate_inputs,
-            **kwargs,
+        # self.model(
+        #     input_ids,
+        #     positions,
+        #     kv_caches,
+        #     attn_metadata,
+        #     intermediate_inputs,
+        #     **kwargs,
+        # )
+        self.runner_dense = CUDAGraphRunner(self.model, self.backend_name)
+        self.runner_dense.capture(
+            input_ids=input_ids,
+            positions=positions,
+            hidden_or_intermediate_states=hidden_or_intermediate_states,
+            intermediate_inputs=intermediate_inputs,
+            kv_caches=kv_caches,
+            attn_metadata=attn_metadata,
+            memory_pool=memory_pool,
+            stream=stream,
+            **kwargs
         )
+        
+        memory_pool = self.runner_dense.graph.pool()
         
         for module in self.model.modules():
             if isinstance(module, Attention):
@@ -1791,12 +1811,15 @@ class HiPCUDAGraphRunner:
                     impl.prefix_query_alpha = prefix_alpha
                     
                     self.mask_refresh_prefixes[module] = prefix_queries
+                    
+                    self.dense_cached_query[module] = last_query
                 
                 impl.checkout_query = True
                 impl.checkout_last_mask_metadata = True
                 impl.use_last_mask = False
                 impl.last_mask_metadata = None
                 impl.last_query = None
+                impl.force_dense = False
         
         self.runner_mask_refresh = CUDAGraphRunner(self.model, self.backend_name)
         self.runner_mask_refresh.capture(
@@ -1816,12 +1839,15 @@ class HiPCUDAGraphRunner:
         for module in self.model.modules():
             if isinstance(module, Attention):
                 impl = module.impl # type: HiPAttentionImpl
+                if not (impl.layer_index in impl.dense_layer_indices):
+                    self.mask_cached_mask_metadatas[module] = impl.last_mask_metadata
                 impl.checkout_query = True
                 impl.checkout_last_mask_metadata = False
                 impl.use_last_mask = True
                 impl.last_query = None
                 impl.use_query_prefix = False
                 impl.prefix_queries = None
+                impl.force_dense = False
         
         self.runner_mask_cached = CUDAGraphRunner(self.model, self.backend_name)
         self.runner_mask_cached.capture(
@@ -1850,32 +1876,46 @@ class HiPCUDAGraphRunner:
                 impl.last_query = None
                 impl.use_query_prefix = False
                 impl.prefix_queries = None
+                impl.force_dense = False
     
     def forward(
         self, *args, **kwargs,
     ) -> torch.Tensor:
-        is_first_step = self.step == 0
-        step_to_refresh = (self.step % self.refresh_interval) == 0
-        if step_to_refresh:
-            if self.use_prefix_query:
-                for value in self.mask_refresh_prefix_alpha.values():
-                    if is_first_step:
-                        value.fill_(0.0)
-                    else:
-                        value.fill_(1.0)
-            result = self.runner_mask_refresh.forward(*args, **kwargs)
-        else:
-            result = self.runner_mask_cached.forward(*args, **kwargs)
-            if self.use_prefix_query:
+        if self.use_first_dense_iteration and (self.step < self.refresh_interval):
+            result = self.runner_dense.forward(*args, **kwargs)
+            if self.use_prefix_query and (self.step > 0):
                 for module in self.model.modules():
                     if isinstance(module, Attention):
                         impl = module.impl # type: HiPAttentionImpl
                         if impl.layer_index in impl.dense_layer_indices: continue
                         
-                        last_query = self.mask_cached_query[module]
+                        last_query = self.dense_cached_query[module]
                         prefix = self.mask_refresh_prefixes[module]
                         prefix_index = (self.step % self.refresh_interval) - 1
                         prefix[:, prefix_index:prefix_index+1].copy_(last_query, non_blocking=True)
+        else:
+            is_first_step = (self.step == 0)
+            step_to_refresh = (self.step % self.refresh_interval) == 0
+            if step_to_refresh:
+                if self.use_prefix_query and (not self.use_first_dense_iteration):
+                    for value in self.mask_refresh_prefix_alpha.values():
+                        if is_first_step:
+                            value.fill_(0.0)
+                        else:
+                            value.fill_(1.0)
+                result = self.runner_mask_refresh.forward(*args, **kwargs)
+            else:
+                result = self.runner_mask_cached.forward(*args, **kwargs)
+                if self.use_prefix_query:
+                    for module in self.model.modules():
+                        if isinstance(module, Attention):
+                            impl = module.impl # type: HiPAttentionImpl
+                            if impl.layer_index in impl.dense_layer_indices: continue
+                            
+                            last_query = self.mask_cached_query[module]
+                            prefix = self.mask_refresh_prefixes[module]
+                            prefix_index = (self.step % self.refresh_interval) - 1
+                            prefix[:, prefix_index:prefix_index+1].copy_(last_query, non_blocking=True)
         self.step += 1
         return result
 

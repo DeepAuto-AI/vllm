@@ -541,6 +541,8 @@ class HiPAttentionImpl(AttentionImpl):
         self.use_query_prefix = False
         self.prefix_queries: Optional[torch.Tensor] = None
         self.prefix_query_alpha: Optional[torch.Tensor] = None
+        
+        self.force_dense = False
 
     def forward(
         self,
@@ -699,9 +701,11 @@ class HiPAttentionImpl(AttentionImpl):
             # Decoding run.
             
             query = decode_query.unsqueeze(1)
+            if self.checkout_query:
+                self.last_query = query
             
             assert self.alibi_slopes is None
-            if self.layer_index in self.dense_layer_indices:
+            if (self.layer_index in self.dense_layer_indices) or self.force_dense:
                 context = flash_attn_with_kvcache(
                     query,
                     key_cache,
@@ -715,9 +719,6 @@ class HiPAttentionImpl(AttentionImpl):
             else:
                 if not self.use_last_mask:
                     self.last_mask_metadata = None
-                
-                if self.checkout_query:
-                    self.last_query = query
                 
                 if self.use_query_prefix:
                     assert self.prefix_query_alpha is not None
