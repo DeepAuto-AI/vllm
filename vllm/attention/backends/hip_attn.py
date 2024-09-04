@@ -56,10 +56,12 @@ class HiPAttentionEnvs:
         
         self.hip_k = int(os.getenv('HIP_K', '512'))
         self.hip_bq = int(os.getenv('HIP_BQ', '32'))
-        self.hip_bsq = int(os.getenv('HIP_BSK', '2'))
+        self.hip_bsq = int(os.getenv('HIP_BSK', '1'))
         self.hip_bk = int(os.getenv('HIP_BK', '2'))
         self.hip_bsk = int(os.getenv('HIP_BSK', '1'))
         
+        self.hip_prefill_bq = int(os.getenv('HIP_PREFILL_BQ', self.hip_bq))
+        self.hip_prefill_bsq = int(os.getenv('HIP_PREFILL_BSQ', max(2, self.hip_bsq)))
         self.hip_prefill_bk = int(os.getenv('HIP_PREFILL_BK', self.hip_bk))
         self.hip_prefill_bsk = int(os.getenv('HIP_PREFILL_BSK', self.hip_bsk))
         
@@ -509,7 +511,7 @@ class HiPAttentionImpl(AttentionImpl):
         self.hip_kwargs = {
             'mask_k': envs.hip_k,
             'block_size_q': envs.hip_bq,
-            'block_stride_k': envs.hip_bsq,
+            'block_stride_q': envs.hip_bsq,
             'block_size_k': envs.hip_bk,
             'block_stride_k': envs.hip_bsk,
             'sample_method': envs.hip_sample_method,
@@ -519,6 +521,8 @@ class HiPAttentionImpl(AttentionImpl):
         print(self.hip_kwargs)
         self.hip_prefill_kwargs = copy.deepcopy(self.hip_kwargs)
         self.hip_prefill_kwargs.update({
+            'block_size_q': envs.hip_prefill_bq,
+            'block_stride_q': envs.hip_prefill_bsq,
             'block_size_k': envs.hip_prefill_bk,
             'block_stride_k': envs.hip_prefill_bsk,
             'num_dense_queries': envs.hip_seq_threshold,
@@ -531,6 +535,12 @@ class HiPAttentionImpl(AttentionImpl):
         self.use_last_mask = False
         self.last_mask_metadata: Optional[
             HiPAttentionOutputMetadata] = None
+        
+        self.checkout_query = False
+        self.last_query: Optional[torch.Tensor] = None
+        self.use_query_prefix = False
+        self.prefix_queries: Optional[torch.Tensor] = None
+        self.prefix_query_alpha: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -688,10 +698,12 @@ class HiPAttentionImpl(AttentionImpl):
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
             
+            query = decode_query.unsqueeze(1)
+            
             assert self.alibi_slopes is None
             if self.layer_index in self.dense_layer_indices:
-                output[num_prefill_tokens:] = flash_attn_with_kvcache(
-                    decode_query.unsqueeze(1),
+                context = flash_attn_with_kvcache(
+                    query,
                     key_cache,
                     value_cache,
                     block_table=decode_meta.block_tables,
@@ -699,13 +711,24 @@ class HiPAttentionImpl(AttentionImpl):
                     softmax_scale=self.scale,
                     causal=True,
                     alibi_slopes=self.alibi_slopes,
-                ).squeeze(1)
+                )
             else:
                 if not self.use_last_mask:
                     self.last_mask_metadata = None
                 
-                out, hip_meta = paged_hip_attention(
-                    q=decode_query.unsqueeze(1),
+                if self.checkout_query:
+                    self.last_query = query
+                
+                if self.use_query_prefix:
+                    assert self.prefix_query_alpha is not None
+                    prefixed_query = torch.cat([self.prefix_queries, query], dim=1)
+                    _, repeated_query = torch.broadcast_tensors(prefixed_query, query)
+                    query = \
+                        prefixed_query * self.prefix_query_alpha +\
+                        repeated_query * (1 - self.prefix_query_alpha)
+                
+                context, hip_meta = paged_hip_attention(
+                    q=query,
                     softmax_scale=self.scale,
                     args=HiPAttentionArgs(
                         k_cache=key_cache,
@@ -716,10 +739,14 @@ class HiPAttentionImpl(AttentionImpl):
                     ),
                     previous_mask_metadata=self.last_mask_metadata,
                 )
-                output[num_prefill_tokens:] = out.squeeze(1)
+                
+                if self.use_query_prefix:
+                    context = context[:, self.prefix_queries.shape[1]:]
                 
                 if self.checkout_last_mask_metadata:
                     self.last_mask_metadata = hip_meta
+                
+            output[num_prefill_tokens:] = context.squeeze(1)
 
         # Reshape the output tensor.
         return output.view(num_tokens, hidden_size)

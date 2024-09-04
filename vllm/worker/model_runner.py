@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+import tqdm
 
 try:
     from flashinfer import BatchDecodeWithPagedKVCacheWrapper
@@ -156,8 +157,10 @@ class ModelInputForGPUWithSamplingMetadata(ModelInputForGPU):
             "finished_requests_ids": self.finished_requests_ids,
         }
         _add_attn_metadata_broadcastable_dict(tensor_dict, self.attn_metadata)
-        _add_sampling_metadata_broadcastable_dict(tensor_dict,
-                                                  self.sampling_metadata)
+        _add_sampling_metadata_broadcastable_dict(
+            tensor_dict,
+            self.sampling_metadata,
+        )
         return tensor_dict
 
     @classmethod
@@ -1254,7 +1257,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             # memory usage of CUDA graph.
             for virtual_engine in range(
                     self.parallel_config.pipeline_parallel_size):
-                for batch_size in reversed(batch_size_capture_list):
+                for batch_size in tqdm.tqdm(list(reversed(batch_size_capture_list)), desc='Graph Capture', leave=False, dynamic_ncols=True):
                     if self.attn_backend.get_name() == "flashinfer":
                         _indptr_buffer = indptr_buffer[:batch_size + 1]
                         _last_page_len_buffer = last_page_len_buffer[:
@@ -1728,6 +1731,11 @@ class HiPCUDAGraphRunner:
         
         self.runner_mask_refresh: CUDAGraphRunner = None
         self.runner_mask_cached: CUDAGraphRunner = None
+        
+        self.use_prefix_query = True
+        self.mask_refresh_prefix_alpha: Dict[torch.nn.Module, torch.Tensor] = {}
+        self.mask_refresh_prefixes: Dict[torch.nn.Module, torch.Tensor] = {}
+        self.mask_cached_query: Dict[torch.nn.Module, torch.Tensor] = {}
     
     def capture(
         self,
@@ -1747,9 +1755,48 @@ class HiPCUDAGraphRunner:
         for module in self.model.modules():
             if isinstance(module, Attention):
                 impl = module.impl # type: HiPAttentionImpl
+                impl.checkout_query = True
+                impl.checkout_last_mask_metadata = False
+                impl.use_last_mask = False
+                impl.last_mask_metadata = None
+                impl.use_query_prefix = False
+                impl.prefix_queries = None
+        
+        self.model(
+            input_ids,
+            positions,
+            kv_caches,
+            attn_metadata,
+            intermediate_inputs,
+            **kwargs,
+        )
+        
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                impl = module.impl # type: HiPAttentionImpl
+                
+                if not (impl.layer_index in impl.dense_layer_indices):
+                    impl.use_query_prefix = self.use_prefix_query
+                    num_prefix_queries = self.refresh_interval - 1
+                    last_query = impl.last_query
+                    N, T, H, HID = last_query.shape
+                    prefix_queries = torch.zeros(
+                        (N, T * num_prefix_queries, H, HID), 
+                        dtype=last_query.dtype, 
+                        device=last_query.device,
+                    )
+                    impl.prefix_queries = prefix_queries
+                
+                    prefix_alpha = torch.tensor(0, dtype=last_query.dtype, device=last_query.device)
+                    impl.prefix_query_alpha = prefix_alpha
+                    
+                    self.mask_refresh_prefixes[module] = prefix_queries
+                
+                impl.checkout_query = True
                 impl.checkout_last_mask_metadata = True
                 impl.use_last_mask = False
                 impl.last_mask_metadata = None
+                impl.last_query = None
         
         self.runner_mask_refresh = CUDAGraphRunner(self.model, self.backend_name)
         self.runner_mask_refresh.capture(
@@ -1769,8 +1816,12 @@ class HiPCUDAGraphRunner:
         for module in self.model.modules():
             if isinstance(module, Attention):
                 impl = module.impl # type: HiPAttentionImpl
+                impl.checkout_query = True
                 impl.checkout_last_mask_metadata = False
                 impl.use_last_mask = True
+                impl.last_query = None
+                impl.use_query_prefix = False
+                impl.prefix_queries = None
         
         self.runner_mask_cached = CUDAGraphRunner(self.model, self.backend_name)
         self.runner_mask_cached.capture(
@@ -1788,19 +1839,45 @@ class HiPCUDAGraphRunner:
         for module in self.model.modules():
             if isinstance(module, Attention):
                 impl = module.impl # type: HiPAttentionImpl
+                
+                if impl.layer_index not in impl.dense_layer_indices:
+                    self.mask_cached_query[module] = impl.last_query
+                
+                impl.checkout_query = False
                 impl.checkout_last_mask_metadata = False
                 impl.use_last_mask = False
                 impl.last_mask_metadata = None
+                impl.last_query = None
+                impl.use_query_prefix = False
+                impl.prefix_queries = None
     
     def forward(
         self, *args, **kwargs,
     ) -> torch.Tensor:
+        is_first_step = self.step == 0
         step_to_refresh = (self.step % self.refresh_interval) == 0
-        self.step += 1
         if step_to_refresh:
-            return self.runner_mask_refresh.forward(*args, **kwargs)
+            if self.use_prefix_query:
+                for value in self.mask_refresh_prefix_alpha.values():
+                    if is_first_step:
+                        value.fill_(0.0)
+                    else:
+                        value.fill_(1.0)
+            result = self.runner_mask_refresh.forward(*args, **kwargs)
         else:
-            return self.runner_mask_cached.forward(*args, **kwargs)
+            result = self.runner_mask_cached.forward(*args, **kwargs)
+            if self.use_prefix_query:
+                for module in self.model.modules():
+                    if isinstance(module, Attention):
+                        impl = module.impl # type: HiPAttentionImpl
+                        if impl.layer_index in impl.dense_layer_indices: continue
+                        
+                        last_query = self.mask_cached_query[module]
+                        prefix = self.mask_refresh_prefixes[module]
+                        prefix_index = (self.step % self.refresh_interval) - 1
+                        prefix[:, prefix_index:prefix_index+1].copy_(last_query, non_blocking=True)
+        self.step += 1
+        return result
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
