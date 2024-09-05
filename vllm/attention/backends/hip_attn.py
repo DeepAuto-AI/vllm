@@ -51,17 +51,19 @@ class HiPAttentionEnvs:
                 'From HiP 1.1, this changed into list of integers, e.g., `0,1,2` '
                 'Are you sure about this?'
             )
-        except: pass
-        self.hip_dense_layers = [int(i) for i in self.hip_dense_layers.split(',')]
+            self.hip_dense_layers = list(range(t))
+        except:
+            self.hip_dense_layers = [int(i) for i in self.hip_dense_layers.split(',')]
         
         self.hip_k = int(os.getenv('HIP_K', '512'))
         self.hip_bq = int(os.getenv('HIP_BQ', '32'))
-        self.hip_bsq = int(os.getenv('HIP_BSK', '1'))
+        self.hip_bsq = int(os.getenv('HIP_BSQ', '1'))
         self.hip_bk = int(os.getenv('HIP_BK', '2'))
         self.hip_bsk = int(os.getenv('HIP_BSK', '1'))
         
+        self.hip_prefill_k = int(os.getenv('HIP_PREFILL_K', self.hip_k))
         self.hip_prefill_bq = int(os.getenv('HIP_PREFILL_BQ', self.hip_bq))
-        self.hip_prefill_bsq = int(os.getenv('HIP_PREFILL_BSQ', max(2, self.hip_bsq)))
+        self.hip_prefill_bsq = int(os.getenv('HIP_PREFILL_BSQ', self.hip_bsq))
         self.hip_prefill_bk = int(os.getenv('HIP_PREFILL_BK', self.hip_bk))
         self.hip_prefill_bsk = int(os.getenv('HIP_PREFILL_BSK', self.hip_bsk))
         
@@ -70,9 +72,36 @@ class HiPAttentionEnvs:
         
         self.hip_sample_method = os.getenv('HIP_SAMPLE_METHOD', 'center')
         
-        self.hip_seq_threshold = int(os.getenv('HIP_SEQ_THRESH', '15000'))
+        self.hip_seq_threshold = int(os.getenv('HIP_SEQ_THRESH', '-1'))
         
         self.hip_offload = os.getenv('HIP_OFFLOAD', '0') == '1'
+        
+        print(f'Deocde Config: {self.decode_kwargs()}')
+        print(f'Prefill Config: {self.prefill_kwargs()}')
+    
+    def decode_kwargs(self):
+        return {
+            'mask_k': self.hip_k,
+            'block_size_q': self.hip_bq,
+            'block_stride_q': self.hip_bsq,
+            'block_size_k': self.hip_bk,
+            'block_stride_k': self.hip_bsk,
+            'sample_method': self.hip_sample_method,
+            'sliding_window_size': self.hip_sw,
+            'sink_token_size': self.hip_nsink,
+        }
+    
+    def prefill_kwargs(self):
+        kwargs = copy.deepcopy(self.decode_kwargs())
+        kwargs.update({
+            'mask_k': self.hip_prefill_k,
+            'block_size_q': self.hip_prefill_bq,
+            'block_stride_q': self.hip_prefill_bsq,
+            'block_size_k': self.hip_prefill_bk,
+            'block_stride_k': self.hip_prefill_bsk,
+            'num_dense_queries': self.hip_seq_threshold,
+        })
+        return kwargs
 
 envs = HiPAttentionEnvs()
 
@@ -507,29 +536,7 @@ class HiPAttentionImpl(AttentionImpl):
             )
         
         self.layer_index = layer_index
-        
-        self.hip_kwargs = {
-            'mask_k': envs.hip_k,
-            'block_size_q': envs.hip_bq,
-            'block_stride_q': envs.hip_bsq,
-            'block_size_k': envs.hip_bk,
-            'block_stride_k': envs.hip_bsk,
-            'sample_method': envs.hip_sample_method,
-            'sliding_window_size': envs.hip_sw,
-            'sink_token_size': envs.hip_nsink,
-        }
-        print(self.hip_kwargs)
-        self.hip_prefill_kwargs = copy.deepcopy(self.hip_kwargs)
-        self.hip_prefill_kwargs.update({
-            'block_size_q': envs.hip_prefill_bq,
-            'block_stride_q': envs.hip_prefill_bsq,
-            'block_size_k': envs.hip_prefill_bk,
-            'block_stride_k': envs.hip_prefill_bsk,
-            'num_dense_queries': envs.hip_seq_threshold,
-        })
-        print(self.hip_prefill_kwargs)
-        self.hip_seq_threshold = envs.hip_seq_threshold
-        self.dense_layer_indices = envs.hip_dense_layers
+        self.envs = envs
         
         self.checkout_last_mask_metadata = False
         self.use_last_mask = False
@@ -631,8 +638,8 @@ class HiPAttentionImpl(AttentionImpl):
                 assert self.logits_soft_cap == 0
                 assert self.sliding_window == (-1, -1)
                 
-                if  (prefill_meta.max_prefill_seq_len < self.hip_seq_threshold) or\
-                    (self.layer_index in self.dense_layer_indices):
+                if  (prefill_meta.max_prefill_seq_len < envs.hip_seq_threshold) or\
+                    (self.layer_index in envs.hip_dense_layers):
                     out = flash_attn_varlen_func(
                         q=query,
                         k=key,
@@ -654,7 +661,7 @@ class HiPAttentionImpl(AttentionImpl):
                         k=key,
                         v=value,
                         seq_lens=prefill_meta.seq_lens,
-                        args=HiPAttentionArgs(**self.hip_prefill_kwargs)
+                        args=HiPAttentionArgs(**envs.prefill_kwargs())
                     )
                 
                 assert output[:num_prefill_tokens].shape == out.shape
@@ -667,8 +674,8 @@ class HiPAttentionImpl(AttentionImpl):
                 assert self.logits_soft_cap == 0
                 
                 max_seq_len = max(prefill_meta.seq_lens)
-                if  (max_seq_len < self.hip_seq_threshold) or\
-                    self.layer_index in self.dense_layer_indices:
+                if  (max_seq_len < envs.hip_seq_threshold) or\
+                    self.layer_index in envs.hip_dense_layers:
                     output[:num_prefill_tokens] = flash_attn_varlen_func(
                         q=query,
                         k=key_cache,
@@ -693,7 +700,7 @@ class HiPAttentionImpl(AttentionImpl):
                             v_cache=value_cache,
                             block_table=prefill_meta.block_tables,
                             cache_seq_lens=prefill_meta.seq_lens_tensor,
-                            **self.hip_prefill_kwargs
+                            **envs.prefill_kwargs(),
                         )
                     )
 
@@ -705,7 +712,7 @@ class HiPAttentionImpl(AttentionImpl):
                 self.last_query = query
             
             assert self.alibi_slopes is None
-            if (self.layer_index in self.dense_layer_indices) or self.force_dense:
+            if (self.layer_index in envs.hip_dense_layers) or self.force_dense:
                 context = flash_attn_with_kvcache(
                     query,
                     key_cache,
@@ -736,7 +743,7 @@ class HiPAttentionImpl(AttentionImpl):
                         v_cache=value_cache,
                         block_table=decode_meta.block_tables,
                         cache_seq_lens=decode_meta.seq_lens_tensor,
-                        **self.hip_kwargs,
+                        **envs.decode_kwargs(),
                     ),
                     previous_mask_metadata=self.last_mask_metadata,
                 )

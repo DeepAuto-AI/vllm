@@ -1795,7 +1795,7 @@ class HiPCUDAGraphRunner:
             if isinstance(module, Attention):
                 impl = module.impl # type: HiPAttentionImpl
                 
-                if not (impl.layer_index in impl.dense_layer_indices):
+                if not (impl.layer_index in impl.envs.hip_dense_layers):
                     impl.use_query_prefix = self.use_prefix_query
                     num_prefix_queries = self.refresh_interval - 1
                     last_query = impl.last_query
@@ -1807,9 +1807,10 @@ class HiPCUDAGraphRunner:
                     )
                     impl.prefix_queries = prefix_queries
                 
-                    prefix_alpha = torch.tensor(0, dtype=last_query.dtype, device=last_query.device)
+                    prefix_alpha = torch.tensor(1.0, dtype=last_query.dtype, device=last_query.device)
                     impl.prefix_query_alpha = prefix_alpha
                     
+                    self.mask_refresh_prefix_alpha[module] = prefix_alpha
                     self.mask_refresh_prefixes[module] = prefix_queries
                     
                     self.dense_cached_query[module] = last_query
@@ -1839,7 +1840,7 @@ class HiPCUDAGraphRunner:
         for module in self.model.modules():
             if isinstance(module, Attention):
                 impl = module.impl # type: HiPAttentionImpl
-                if not (impl.layer_index in impl.dense_layer_indices):
+                if not (impl.layer_index in impl.envs.hip_dense_layers):
                     self.mask_cached_mask_metadatas[module] = impl.last_mask_metadata
                 impl.checkout_query = True
                 impl.checkout_last_mask_metadata = False
@@ -1866,7 +1867,7 @@ class HiPCUDAGraphRunner:
             if isinstance(module, Attention):
                 impl = module.impl # type: HiPAttentionImpl
                 
-                if impl.layer_index not in impl.dense_layer_indices:
+                if impl.layer_index not in impl.envs.hip_dense_layers:
                     self.mask_cached_query[module] = impl.last_query
                 
                 impl.checkout_query = False
@@ -1887,7 +1888,7 @@ class HiPCUDAGraphRunner:
                 for module in self.model.modules():
                     if isinstance(module, Attention):
                         impl = module.impl # type: HiPAttentionImpl
-                        if impl.layer_index in impl.dense_layer_indices: continue
+                        if impl.layer_index in impl.envs.hip_dense_layers: continue
                         
                         last_query = self.dense_cached_query[module]
                         prefix = self.mask_refresh_prefixes[module]
@@ -1897,12 +1898,13 @@ class HiPCUDAGraphRunner:
             is_first_step = (self.step == 0)
             step_to_refresh = (self.step % self.refresh_interval) == 0
             if step_to_refresh:
-                if self.use_prefix_query and (not self.use_first_dense_iteration):
-                    for value in self.mask_refresh_prefix_alpha.values():
-                        if is_first_step:
-                            value.fill_(0.0)
-                        else:
-                            value.fill_(1.0)
+                for value in self.mask_refresh_prefix_alpha.values():
+                    if  is_first_step and\
+                        self.use_prefix_query and\
+                        (not self.use_first_dense_iteration):
+                        value.fill_(0.0)
+                    else:
+                        value.fill_(1.0)
                 result = self.runner_mask_refresh.forward(*args, **kwargs)
             else:
                 result = self.runner_mask_cached.forward(*args, **kwargs)
@@ -1910,7 +1912,7 @@ class HiPCUDAGraphRunner:
                     for module in self.model.modules():
                         if isinstance(module, Attention):
                             impl = module.impl # type: HiPAttentionImpl
-                            if impl.layer_index in impl.dense_layer_indices: continue
+                            if impl.layer_index in impl.envs.hip_dense_layers: continue
                             
                             last_query = self.mask_cached_query[module]
                             prefix = self.mask_refresh_prefixes[module]
