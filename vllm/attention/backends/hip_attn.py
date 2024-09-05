@@ -56,8 +56,8 @@ class HiPAttentionEnvs:
             self.hip_dense_layers = [int(i) for i in self.hip_dense_layers.split(',')]
         
         self.hip_k = int(os.getenv('HIP_K', '512'))
-        self.hip_bq = int(os.getenv('HIP_BQ', '32'))
-        self.hip_bsq = int(os.getenv('HIP_BSQ', '1'))
+        self.hip_bq = int(os.getenv('HIP_BQ', '64'))
+        self.hip_bsq = int(os.getenv('HIP_BSQ', '2'))
         self.hip_bk = int(os.getenv('HIP_BK', '2'))
         self.hip_bsk = int(os.getenv('HIP_BSK', '1'))
         
