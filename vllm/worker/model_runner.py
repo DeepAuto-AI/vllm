@@ -1899,9 +1899,11 @@ class HiPCUDAGraphRunner:
             step_to_refresh = (self.step % self.refresh_interval) == 0
             if step_to_refresh:
                 for value in self.mask_refresh_prefix_alpha.values():
-                    if  is_first_step and\
-                        self.use_prefix_query and\
-                        (not self.use_first_dense_iteration):
+                    if  (not self.use_prefix_query) or (
+                            self.use_prefix_query and\
+                            is_first_step and\
+                            (not self.use_first_dense_iteration)
+                        ):
                         value.fill_(0.0)
                     else:
                         value.fill_(1.0)
