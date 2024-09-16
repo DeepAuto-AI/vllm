@@ -38,6 +38,7 @@ class GLMAttention(nn.Module):
         config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_index: Optional[int] = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -88,12 +89,15 @@ class GLMAttention(nn.Module):
             base=10000 * rope_ratio,
             is_neox_style=False,
         )
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config)
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            layer_index=layer_index,
+        )
 
     def forward(
         self,
@@ -172,6 +176,7 @@ class GLMBlock(nn.Module):
         config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_index: Optional[int] = None,
     ):
         super().__init__()
         self.apply_residual_connection_post_layernorm = (
@@ -185,7 +190,7 @@ class GLMBlock(nn.Module):
                                                eps=config.layernorm_epsilon)
 
         # Self attention.
-        self.self_attention = GLMAttention(config, cache_config, quant_config)
+        self.self_attention = GLMAttention(config, cache_config, quant_config, layer_index=layer_index)
         self.hidden_dropout = config.hidden_dropout
 
         # Layernorm on the attention output
@@ -252,7 +257,7 @@ class GLMTransformer(nn.Module):
 
         # Transformer layers.
         self.layers = nn.ModuleList([
-            GLMBlock(config, cache_config, quant_config)
+            GLMBlock(config, cache_config, quant_config, layer_index=i)
             for i in range(self.num_layers)
         ])
 
