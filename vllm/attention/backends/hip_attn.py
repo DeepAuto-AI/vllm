@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 
 class HiPAttentionEnvs:
     def __init__(self):
+        self.show_warnings = os.getenv('HIP_WARNINGS', '0') == '1'
+        
         self.refresh_interval = int(os.getenv('HIP_REFRESH_INTERVAL', '8'))
         self.hip_dense_layers = os.getenv('HIP_DENSE_LAYERS', '0,1,2')
         try:
@@ -657,6 +659,8 @@ class HiPAttentionImpl(AttentionImpl):
                         softcap=self.logits_soft_cap,
                     )
                 else:
+                    if envs.show_warnings:
+                        warnings.warn('HiP is used in prefill')
                     out = varlen_hip_attention(
                         q=query,
                         softmax_scale=self.scale,
@@ -694,6 +698,8 @@ class HiPAttentionImpl(AttentionImpl):
                         softcap=self.logits_soft_cap,
                     )
                 else:
+                    if envs.show_warnings:
+                        warnings.warn('HiP is used in prefix prefill')
                     output[:num_prefill_tokens] = paged_varlen_hip_attention(
                         q=query,
                         softmax_scale=self.scale,
@@ -737,6 +743,9 @@ class HiPAttentionImpl(AttentionImpl):
                     query = \
                         prefixed_query * self.prefix_query_alpha +\
                         repeated_query * (1 - self.prefix_query_alpha)
+                
+                if envs.show_warnings:
+                        warnings.warn('HiP is used in decode')
                 
                 context, hip_meta = paged_hip_attention(
                     q=query,
