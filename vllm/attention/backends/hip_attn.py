@@ -62,6 +62,7 @@ class HiPAttentionEnvs:
         self.hip_bsq = int(os.getenv('HIP_BSQ', '2'))
         self.hip_bk = int(os.getenv('HIP_BK', '2'))
         self.hip_bsk = int(os.getenv('HIP_BSK', '1'))
+        self.hip_bk_after_mask = int(os.getenv('HIP_BK_AFTER_MASK', '-1'))
         
         self.hip_prefill_k = int(os.getenv('HIP_PREFILL_K', self.hip_k))
         self.hip_prefill_bq = int(os.getenv('HIP_PREFILL_BQ', self.hip_bq))
@@ -89,6 +90,7 @@ class HiPAttentionEnvs:
             'block_stride_q': self.hip_bsq,
             'block_size_k': self.hip_bk,
             'block_stride_k': self.hip_bsk,
+            'block_size_k_after_masking': self.hip_bk_after_mask,
             'sample_method': self.hip_sample_method,
             'sliding_window_size': self.hip_sw,
             'sink_token_size': self.hip_nsink,
@@ -101,6 +103,7 @@ class HiPAttentionEnvs:
             'block_size_q': self.hip_prefill_bq,
             'block_stride_q': self.hip_prefill_bsq,
             'block_size_k': self.hip_prefill_bk,
+            'block_size_k_after_masking': self.hip_bk_after_mask,
             'block_stride_k': self.hip_prefill_bsk,
             'num_dense_queries': self.hip_seq_threshold,
         })
