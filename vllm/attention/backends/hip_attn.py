@@ -647,7 +647,6 @@ class HiPAttentionImpl(AttentionImpl):
                 if  (prefill_meta.max_prefill_seq_len < envs.hip_seq_threshold) or\
                     (envs.hip_prefill_always_dense) or\
                     (self.layer_index in envs.hip_dense_layers):
-                    print('asdfasdf')
                     out = flash_attn_varlen_func(
                         q=query,
                         k=key,
@@ -687,7 +686,6 @@ class HiPAttentionImpl(AttentionImpl):
                 if  (max_seq_len < envs.hip_seq_threshold) or\
                     (envs.hip_prefill_always_dense) or\
                     self.layer_index in envs.hip_dense_layers:
-                    print('asdfasdf222')
                     output[:num_prefill_tokens] = flash_attn_varlen_func(
                         q=query,
                         k=key_cache,
