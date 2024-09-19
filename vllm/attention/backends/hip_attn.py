@@ -63,6 +63,7 @@ class HiPAttentionEnvs:
         self.hip_bk = int(os.getenv('HIP_BK', '2'))
         self.hip_bsk = int(os.getenv('HIP_BSK', '1'))
         self.hip_bk_after_mask = int(os.getenv('HIP_BK_AFTER_MASK', '-1'))
+        self.hip_decode_always_dense = os.getenv('HIP_DECODE_ALWAYS_DENSE', '0') == '1'
         
         self.hip_prefill_k = int(os.getenv('HIP_PREFILL_K', self.hip_k))
         self.hip_prefill_bq = int(os.getenv('HIP_PREFILL_BQ', self.hip_bq))
@@ -724,7 +725,9 @@ class HiPAttentionImpl(AttentionImpl):
                 self.last_query = query
             
             assert self.alibi_slopes is None
-            if (self.layer_index in envs.hip_dense_layers) or self.force_dense:
+            if (self.layer_index in envs.hip_dense_layers) or\
+                self.force_dense or\
+                envs.hip_decode_always_dense:
                 context = flash_attn_with_kvcache(
                     query,
                     key_cache,
