@@ -1,7 +1,7 @@
 """
 Attention Layer with HiPAttention.
 
-DeepAuto-AI @ 2024, Written by Heejun Lee and Geon Park
+HiP @ 2024, Written by Authors
 """
 import copy
 from dataclasses import dataclass
