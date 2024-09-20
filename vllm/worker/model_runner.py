@@ -1733,8 +1733,8 @@ class HiPCUDAGraphRunner:
         self.runner_mask_cached: CUDAGraphRunner = None
         self.runner_dense: CUDAGraphRunner = None
         
-        self.use_first_dense_iteration = os.getenv('HIP_FIRST_DENSE_ITERATION', '1') == '1'
-        self.use_prefix_query = os.getenv('HIP_PREFIX_QUERY', '1') == '1'
+        self.use_first_dense_iteration = os.getenv('HIP_FIRST_DENSE_ITERATION', '0') == '1'
+        self.use_prefix_query = os.getenv('HIP_PREFIX_QUERY', '0') == '1'
         self.mask_refresh_prefix_alpha: Dict[torch.nn.Module, torch.Tensor] = {}
         self.mask_refresh_prefixes: Dict[torch.nn.Module, torch.Tensor] = {}
         self.mask_cached_query: Dict[torch.nn.Module, torch.Tensor] = {}
