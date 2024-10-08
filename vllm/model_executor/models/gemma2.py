@@ -147,14 +147,16 @@ class Gemma2Attention(nn.Module):
         use_sliding_window = (layer_idx % 2 == 1
                               and config.sliding_window is not None)
         del use_sliding_window  # Unused.
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config,
-                              logits_soft_cap=attn_logits_soft_cap,
-                              layer_index=layer_index)
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            logits_soft_cap=attn_logits_soft_cap,
+            layer_index=layer_idx,
+        )
 
     def forward(
         self,
