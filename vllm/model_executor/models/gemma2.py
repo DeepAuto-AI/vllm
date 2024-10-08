@@ -91,7 +91,8 @@ class Gemma2Attention(nn.Module):
                  rope_theta: float,
                  cache_config: Optional[CacheConfig] = None,
                  quant_config: Optional[QuantizationConfig] = None,
-                 attn_logits_soft_cap: Optional[float] = None) -> None:
+                 attn_logits_soft_cap: Optional[float] = None,
+                 layer_index: int = 0) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -195,6 +196,7 @@ class Gemma2DecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             attn_logits_soft_cap=config.attn_logit_softcapping,
+            layer_index=layer_idx,
         )
         self.hidden_size = config.hidden_size
         self.mlp = Gemma2MLP(
